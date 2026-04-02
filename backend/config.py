@@ -28,11 +28,11 @@ class Settings(BaseSettings):
 
     # ETL behaviour
     # Number of politicians to fetch per SPARQL page (LIMIT per request)
-    etl_page_size: int = 200
+    etl_page_size: int = 100
     # Maximum pages to fetch — set to 0 for no cap (full dataset)
     etl_max_pages: int = 0
     # Seconds to wait between SPARQL requests (polite crawling)
-    etl_request_delay: float = 1.0
+    etl_request_delay: float = 3.0
     # Maximum number of retries per failed SPARQL request
     etl_max_retries: int = 5
 

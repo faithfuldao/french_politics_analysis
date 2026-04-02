@@ -24,6 +24,7 @@ from typing import Optional
 from neo4j import ManagedTransaction
 
 from backend.db.neo4j_client import close_driver, get_driver, run_constraints
+from backend.etl.page_scraper import scrape_all_pages
 from backend.etl.wikidata_scraper import (
     fetch_mandates,
     fetch_party_memberships,
@@ -46,13 +47,14 @@ logger = logging.getLogger(__name__)
 _UPSERT_PERSON_QUERY = """
 MERGE (p:Person {wikidata_id: $wikidata_id})
 SET
-  p.name            = $name,
-  p.date_of_birth   = $date_of_birth,
-  p.date_of_death   = $date_of_death,
-  p.gender          = $gender,
+  p.name             = $name,
+  p.description      = $description,
+  p.date_of_birth    = $date_of_birth,
+  p.date_of_death    = $date_of_death,
+  p.gender           = $gender,
   p.wikipedia_fr_url = $wikipedia_fr_url,
-  p.image_url       = $image_url,
-  p.updated_at      = datetime()
+  p.image_url        = $image_url,
+  p.updated_at       = datetime()
 RETURN p.wikidata_id AS wikidata_id
 """
 
@@ -72,6 +74,7 @@ def upsert_person(tx: ManagedTransaction, person: Person) -> None:
         _UPSERT_PERSON_QUERY,
         wikidata_id=person.wikidata_id,
         name=person.name,
+        description=person.description,
         date_of_birth=person.date_of_birth,
         date_of_death=person.date_of_death,
         gender=person.gender,
@@ -245,16 +248,28 @@ _BATCH_SIZE = 500  # commit every N records to bound transaction memory
 
 
 def _load_persons_batch(persons: list[Person]) -> int:
-    """Load all Person nodes in batched write transactions."""
+    """Load all Person nodes in batched write transactions.
+
+    Each person is upserted individually so a single bad row never
+    causes the rest of the batch to be skipped.
+    """
     driver = get_driver()
     loaded = 0
+    skipped = 0
     for i in range(0, len(persons), _BATCH_SIZE):
         batch = persons[i : i + _BATCH_SIZE]
         with driver.session() as session:
             for person in batch:
-                session.execute_write(upsert_person, person)
-            loaded += len(batch)
-        logger.info("  Persons: %d / %d loaded", loaded, len(persons))
+                try:
+                    session.execute_write(upsert_person, person)
+                    loaded += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping person %s (%s): %s",
+                        person.name, person.wikidata_id, exc,
+                    )
+                    skipped += 1
+        logger.info("  Persons: %d / %d loaded (%d skipped)", loaded, len(persons), skipped)
     return loaded
 
 
@@ -375,6 +390,61 @@ def _load_mandates_batch(mandates: list[Mandate]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Persons-only load (scrapes page, no SPARQL)
+# ---------------------------------------------------------------------------
+
+def run_persons_load() -> None:
+    """
+    Lightweight ETL that loads only Person nodes from the WikiProject HTML pages.
+
+    This avoids the SPARQL endpoint entirely, making it fast and reliable.
+    Enrichment fields (dates, party, mandates) are left null and can be added
+    by a separate enrichment pass later.
+
+    Steps
+    -----
+    1. Scrape wikidata_id + name + description from the HTML pages.
+    2. Apply schema constraints so MERGE has a unique index to work against.
+    3. Batch-upsert Person nodes into Neo4j.
+    4. Close the driver.
+    5. Print a summary.
+    """
+    logger.info("=" * 60)
+    logger.info("French Politics Graph — Persons-only load starting")
+    logger.info("=" * 60)
+
+    # Step 1: Scrape persons from WikiProject HTML pages (no SPARQL)
+    logger.info("[1/3] Scraping politicians from WikiProject HTML pages...")
+    persons = scrape_all_pages()
+    logger.info("      -> %d unique politicians scraped.", len(persons))
+
+    if not persons:
+        logger.error("No politicians scraped — aborting load.")
+        return
+
+    # Step 2: Ensure schema constraints exist before any MERGE
+    logger.info("[2/3] Applying schema constraints and indexes...")
+    run_constraints()
+
+    # Step 3: Upsert Person nodes
+    logger.info("[3/3] Loading Person nodes into Neo4j...")
+    n_loaded = _load_persons_batch(persons)
+
+    # Step 4: Release connection pool
+    close_driver()
+
+    # Summary
+    logger.info("=" * 60)
+    logger.info("Persons load complete. Summary:")
+    logger.info("  Scraped:  %d politicians", len(persons))
+    logger.info("  Loaded:   %d Person nodes upserted", n_loaded)
+    logger.info("  Skipped:  %d (logged above as warnings)", len(persons) - n_loaded)
+    logger.info("=" * 60)
+
+    print(f"\nDone. {n_loaded} / {len(persons)} Person nodes loaded into Neo4j.")
+
+
+# ---------------------------------------------------------------------------
 # Full ETL orchestration
 # ---------------------------------------------------------------------------
 
@@ -467,10 +537,19 @@ if __name__ == "__main__":
         description="Run the French Politics Graph ETL pipeline."
     )
     parser.add_argument(
+        "--persons-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Scrape Person nodes from WikiProject HTML pages and load them "
+            "into Neo4j. Skips SPARQL entirely. Enrichment comes later."
+        ),
+    )
+    parser.add_argument(
         "--page-size",
         type=int,
         default=None,
-        help="Number of results per SPARQL page (default: from config)",
+        help="Number of results per SPARQL page (default: from config). Ignored with --persons-only.",
     )
     parser.add_argument(
         "--max-pages",
@@ -479,12 +558,16 @@ if __name__ == "__main__":
         help=(
             "Max number of pages to fetch per query. "
             "0 = unlimited (full dataset). "
-            "Use 1 for a quick smoke test."
+            "Use 1 for a quick smoke test. Ignored with --persons-only."
         ),
     )
     args = parser.parse_args()
 
-    try:
-        run_full_load(page_size=args.page_size, max_pages=args.max_pages)
-    finally:
-        close_driver()
+    if args.persons_only:
+        # run_persons_load() handles close_driver() internally
+        run_persons_load()
+    else:
+        try:
+            run_full_load(page_size=args.page_size, max_pages=args.max_pages)
+        finally:
+            close_driver()

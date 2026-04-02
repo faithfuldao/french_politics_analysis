@@ -1,27 +1,35 @@
 """
-Wikidata SPARQL scraper for French politicians.
+Wikidata two-phase scraper for French politicians.
 
-This module contains three public functions:
+Phase 1 — ID harvest
+---------------------
+Small, targeted SPARQL queries per assembly session, senate, and executive
+position fetch only ?item (Q-ids).  Each query is ultra-fast: no labels,
+no OPTIONAL properties, no country joins.  These queries never 504.
 
-    fetch_politicians()      -> list[Person]
-    fetch_party_memberships() -> list[PartyMembership]
-    fetch_mandates()         -> list[Mandate]
+Phase 2 — Entity fetch
+-----------------------
+Batches of up to 50 Q-ids are sent to the Wikidata ``wbgetentities`` REST
+API, which returns the full JSON entity blob per politician.  Properties
+are extracted from the claim arrays rather than from SPARQL bindings.
 
-Each function queries the Wikidata public SPARQL endpoint with proper
-pagination (LIMIT / OFFSET), exponential backoff on failures, and a
-polite User-Agent header as required by Wikidata's bot policy.
+Public interface (unchanged from the previous implementation)
+--------------------------------------------------------------
+    fetch_politicians(page_size=None, max_pages=0) -> list[Person]
+    fetch_party_memberships(page_size=None, max_pages=0) -> tuple[list[PartyMembership], list[Party]]
+    fetch_mandates(page_size=None, max_pages=0) -> list[Mandate]
+
+The ``page_size`` parameter is repurposed as the wbgetentities batch size
+(default 50, which is the API maximum).  ``max_pages`` is repurposed as the
+maximum number of entity batches to process — set to 1 for a quick smoke
+test covering only the first 50 entities.
+
+All three public functions share a single entity fetch pass via a
+module-level cache so the HTTP work is only done once per process.
 
 All dates are normalised to ISO-8601 strings (YYYY-MM-DD) or None.
-Wikidata returns dates in the format "+1965-03-15T00:00:00Z"; we strip
-the leading sign, the time component, and any precision suffix.
-
-Design note on SPARQL queries
-------------------------------
-We intentionally use OPTIONAL { } for every nullable property so that
-politicians with incomplete records are still returned rather than
-silently dropped by an inner join.  This trades result set size for
-completeness — appropriate for a knowledge graph that will be enriched
-over time.
+Wikidata claim dates arrive as "+1965-03-15T00:00:00Z"; the same
+``_parse_date()`` helper strips the leading sign and time component.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import urllib.parse
 from typing import Optional
 
 import requests
@@ -44,6 +53,12 @@ logger = logging.getLogger(__name__)
 
 _SESSION: Optional[requests.Session] = None
 
+_USER_AGENT = (
+    "FrenchPoliticsKnowledgeGraph/1.0 "
+    "(educational research project; contact: admin@example.com) "
+    "python-requests"
+)
+
 
 def _get_session() -> requests.Session:
     global _SESSION
@@ -53,11 +68,7 @@ def _get_session() -> requests.Session:
             {
                 # Wikidata requires a descriptive User-Agent.
                 # See: https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual#Caching
-                "User-Agent": (
-                    "FrenchPoliticsKnowledgeGraph/1.0 "
-                    "(educational research project; contact: admin@example.com) "
-                    "python-requests"
-                ),
+                "User-Agent": _USER_AGENT,
                 "Accept": "application/sparql-results+json",
             }
         )
@@ -99,25 +110,118 @@ def _extract_qid(uri: str) -> str:
     return uri.rsplit("/", 1)[-1]
 
 
+def _claim_time(entity: dict, prop: str) -> Optional[str]:
+    """
+    Extract the first time value from a claim array.
+
+    Returns the parsed ISO date string or None.
+    """
+    claims = entity.get("claims", {}).get(prop, [])
+    if not claims:
+        return None
+    try:
+        raw = claims[0]["mainsnak"]["datavalue"]["value"]["time"]
+        return _parse_date(raw)
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _claim_item_id(entity: dict, prop: str) -> Optional[str]:
+    """
+    Extract the first item (Q-id) value from a claim array.
+    """
+    claims = entity.get("claims", {}).get(prop, [])
+    if not claims:
+        return None
+    try:
+        return claims[0]["mainsnak"]["datavalue"]["value"]["id"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _claim_string(entity: dict, prop: str) -> Optional[str]:
+    """
+    Extract the first string value from a claim array.
+    """
+    claims = entity.get("claims", {}).get(prop, [])
+    if not claims:
+        return None
+    try:
+        return claims[0]["mainsnak"]["datavalue"]["value"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _qualifier_time(statement: dict, prop: str) -> Optional[str]:
+    """
+    Extract a time qualifier from a SPARQL-style Wikidata statement dict.
+    """
+    qualifiers = statement.get("qualifiers", {}).get(prop, [])
+    if not qualifiers:
+        return None
+    try:
+        raw = qualifiers[0]["datavalue"]["value"]["time"]
+        return _parse_date(raw)
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _qualifier_item_id(statement: dict, prop: str) -> Optional[str]:
+    """
+    Extract an item (Q-id) qualifier from a statement dict.
+    """
+    qualifiers = statement.get("qualifiers", {}).get(prop, [])
+    if not qualifiers:
+        return None
+    try:
+        return qualifiers[0]["datavalue"]["value"]["id"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _entity_label(entity: dict) -> str:
+    """
+    Return the French label for an entity, falling back to English, then Q-id.
+    """
+    qid = entity.get("id", "")
+    labels = entity.get("labels", {})
+    fr = labels.get("fr", {}).get("value")
+    if fr:
+        return fr
+    en = labels.get("en", {}).get("value")
+    if en:
+        return en
+    return qid
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: SPARQL ID harvest
+# ---------------------------------------------------------------------------
+
+# Assembly sessions to harvest (position Q-id -> human-readable label)
+ASSEMBLY_SESSIONS: dict[str, str] = {
+    "Q24939798": "15th",   # 2017–2022
+    "Q112567407": "16th",  # 2022–present
+}
+
+# Wikidata Q-ids referenced in the harvest queries
+_QIDS = {
+    "depute":   "Q3044918",  # member of French National Assembly (Député)
+    "senateur": "Q3918957",  # member of French Senate
+}
+
+# Executive positions: Président de la République, Premier ministre,
+# Ministre, Secrétaire d'État
+_EXECUTIVE_POSITIONS = "wd:Q191954 wd:Q191958 wd:Q17375 wd:Q27169"
+
+_SPARQL_ENDPOINT = settings.wikidata_sparql_endpoint
+
+
 def _sparql_request(query: str, endpoint: str, retries: int = 5) -> list[dict]:
     """
-    Execute a SPARQL SELECT query against `endpoint` and return the bindings list.
+    Execute a SPARQL SELECT query against ``endpoint`` and return the bindings.
 
-    Implements exponential backoff with jitter for rate-limiting (HTTP 429)
-    and transient server errors (5xx).
-
-    Parameters
-    ----------
-    query:
-        SPARQL SELECT query string.
-    endpoint:
-        SPARQL endpoint URL.
-    retries:
-        Maximum number of retry attempts.
-
-    Returns
-    -------
-    List of binding dicts, e.g. [{"person": {"type": "uri", "value": "..."}, ...}]
+    Implements exponential backoff for HTTP 429 and 5xx responses.
     """
     session = _get_session()
     delay = 2.0  # initial backoff in seconds
@@ -163,93 +267,475 @@ def _sparql_request(query: str, endpoint: str, retries: int = 5) -> list[dict]:
     return []
 
 
-def _paginate_sparql(query_template: str, page_size: int, max_pages: int = 0) -> list[dict]:
+def _run_harvest_query(sparql: str) -> set[str]:
     """
-    Execute `query_template` with LIMIT/OFFSET pagination and collect all rows.
+    Run a single ID-harvest SPARQL query and return the set of Q-ids found.
 
-    The template must contain exactly two format placeholders: {limit} and {offset}.
+    The query must return a single variable ``?item`` bound to Wikidata entity
+    URIs.
+    """
+    bindings = _sparql_request(sparql, _SPARQL_ENDPOINT, retries=settings.etl_max_retries)
+    qids: set[str] = set()
+    for row in bindings:
+        try:
+            uri = row["item"]["value"]
+            qids.add(_extract_qid(uri))
+        except KeyError:
+            pass
+    return qids
+
+
+def _harvest_qids() -> set[str]:
+    """
+    Run all small SPARQL harvest queries and collect unique Q-ids.
+
+    Covers:
+    - National Assembly deputies per session (15th and 16th legislatures)
+    - Senate members (continuous mandate, no session qualifier)
+    - Executive officials (presidents, prime ministers, ministers,
+      secretaries of state)
+    """
+    all_qids: set[str] = set()
+
+    # 1. National Assembly deputies — one query per session
+    for session_qid, label in ASSEMBLY_SESSIONS.items():
+        query = (
+            "SELECT ?item WHERE { "
+            f"?item p:P39 [ ps:P39 wd:{_QIDS['depute']} ; pq:P2937 wd:{session_qid}] "
+            "}"
+        )
+        logger.info("Harvesting Assembly deputies — %s legislature (session %s)...", label, session_qid)
+        found = _run_harvest_query(query)
+        logger.info("  -> %d Q-ids", len(found))
+        all_qids.update(found)
+        time.sleep(1)
+
+    # 2. Senate members — no session qualifier (continuous mandates)
+    senate_query = (
+        "SELECT ?item WHERE { "
+        f"?item p:P39 [ ps:P39 wd:{_QIDS['senateur']} ] "
+        "}"
+    )
+    logger.info("Harvesting Senate members...")
+    found = _run_harvest_query(senate_query)
+    logger.info("  -> %d Q-ids", len(found))
+    all_qids.update(found)
+    time.sleep(1)
+
+    # 3. Executive positions (presidents, PMs, ministers, secretaries of state)
+    exec_query = (
+        f"SELECT ?item WHERE {{ VALUES ?pos {{ {_EXECUTIVE_POSITIONS} }} "
+        "?item wdt:P39 ?pos . }"
+    )
+    logger.info("Harvesting executive officials...")
+    found = _run_harvest_query(exec_query)
+    logger.info("  -> %d Q-ids", len(found))
+    all_qids.update(found)
+
+    logger.info("Total unique Q-ids harvested: %d", len(all_qids))
+    return all_qids
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: wbgetentities batch fetch
+# ---------------------------------------------------------------------------
+
+_WBENTITIES_URL = "https://www.wikidata.org/w/api.php"
+_MAX_IDS_PER_REQUEST = 50
+
+
+def _fetch_entities_batch(qids: list[str], retries: int = 5) -> dict:
+    """
+    Call the Wikidata ``wbgetentities`` API for up to 50 Q-ids.
+
+    Returns the raw ``entities`` dict keyed by Q-id.
+    On failure returns an empty dict (after exhausting retries).
+    """
+    session = _get_session()
+    params = {
+        "action": "wbgetentities",
+        "ids": "|".join(qids),
+        "format": "json",
+        "languages": "fr|en",
+        "props": "labels|claims|sitelinks",
+    }
+    delay = 2.0
+
+    for attempt in range(retries + 1):
+        try:
+            response = session.get(
+                _WBENTITIES_URL,
+                params=params,
+                timeout=60,
+                headers={"Accept": "application/json"},
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("entities", {})
+
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < retries:
+                    wait = delay * (2 ** attempt)
+                    logger.warning(
+                        "HTTP %s from wbgetentities. Retrying in %.1fs (attempt %d/%d).",
+                        response.status_code,
+                        wait,
+                        attempt + 1,
+                        retries,
+                    )
+                    time.sleep(wait)
+                    continue
+                else:
+                    logger.error(
+                        "wbgetentities failed after %d retries for batch: %s",
+                        retries,
+                        qids[:5],
+                    )
+                    return {}
+
+            response.raise_for_status()
+
+        except requests.exceptions.ConnectionError as exc:
+            if attempt < retries:
+                wait = delay * (2 ** attempt)
+                logger.warning("Connection error: %s. Retrying in %.1fs.", exc, wait)
+                time.sleep(wait)
+            else:
+                logger.error("Connection failed for wbgetentities batch: %s", exc)
+                return {}
+
+    return {}
+
+
+def _fetch_all_entities(
+    qids: set[str],
+    batch_size: int = _MAX_IDS_PER_REQUEST,
+    max_batches: int = 0,
+) -> dict:
+    """
+    Fetch all entity data for the given Q-ids in batches.
 
     Parameters
     ----------
-    query_template:
-        A SPARQL query string with {limit} and {offset} placeholders.
-    page_size:
-        Number of results per page.
-    max_pages:
-        0 means fetch all pages; N > 0 stops after N pages (useful for testing).
+    qids:
+        Set of Wikidata Q-identifiers.
+    batch_size:
+        Number of Q-ids per wbgetentities request (max 50).
+    max_batches:
+        0 = fetch all batches.  N > 0 stops after N batches (smoke testing).
+
+    Returns
+    -------
+    Merged ``entities`` dict keyed by Q-id.
     """
-    endpoint = settings.wikidata_sparql_endpoint
-    all_rows: list[dict] = []
-    page = 0
+    batch_size = min(batch_size, _MAX_IDS_PER_REQUEST)
+    qid_list = sorted(qids)  # deterministic order
+    all_entities: dict = {}
+    total_batches = (len(qid_list) + batch_size - 1) // batch_size
 
-    while True:
-        offset = page * page_size
-        query = query_template.format(limit=page_size, offset=offset)
+    logger.info(
+        "Fetching %d entities in %d batches of %d...",
+        len(qid_list),
+        total_batches,
+        batch_size,
+    )
 
-        logger.info("Fetching SPARQL page %d (offset=%d, limit=%d) ...", page + 1, offset, page_size)
-        rows = _sparql_request(query, endpoint, retries=settings.etl_max_retries)
-
-        all_rows.extend(rows)
-        logger.info("  -> Got %d rows (total so far: %d)", len(rows), len(all_rows))
-
-        if len(rows) < page_size:
-            # Last page — fewer results than page_size means we've exhausted the dataset
+    for batch_num, i in enumerate(range(0, len(qid_list), batch_size)):
+        if max_batches > 0 and batch_num >= max_batches:
+            logger.info("Reached max_batches limit (%d). Stopping entity fetch.", max_batches)
             break
 
-        page += 1
-        if max_pages > 0 and page >= max_pages:
-            logger.info("Reached max_pages limit (%d). Stopping pagination.", max_pages)
-            break
+        batch = qid_list[i : i + batch_size]
+        logger.info(
+            "  Batch %d/%d — fetching %d entities (%s … %s)...",
+            batch_num + 1,
+            total_batches,
+            len(batch),
+            batch[0],
+            batch[-1],
+        )
 
-        # Polite delay between requests
-        time.sleep(settings.etl_request_delay)
+        entities = _fetch_entities_batch(batch, retries=settings.etl_max_retries)
+        all_entities.update(entities)
 
-    return all_rows
+        logger.info("  -> %d entities received (running total: %d)", len(entities), len(all_entities))
+
+        if i + batch_size < len(qid_list):
+            # Polite delay between requests — 1 to 3 seconds
+            time.sleep(max(1.0, min(3.0, settings.etl_request_delay)))
+
+    return all_entities
 
 
 # ---------------------------------------------------------------------------
-# Query 1: Base politician data
+# Module-level entity cache — populated on first call, shared across all
+# three public functions within the same process run.
 # ---------------------------------------------------------------------------
 
-_POLITICIANS_QUERY = """
-SELECT DISTINCT
-  ?person
-  ?personLabel
-  ?dateOfBirth
-  ?dateOfDeath
-  ?genderLabel
-  ?wikipediaFR
-  ?image
-WHERE {{
-  # Must be an instance of human
-  ?person wdt:P31 wd:Q5 .
+_ENTITY_CACHE: Optional[dict] = None
+_CACHE_BATCH_SIZE: int = _MAX_IDS_PER_REQUEST
+_CACHE_MAX_BATCHES: int = 0
 
-  # Must have held a political position in France
-  ?person p:P39 ?posStmt .
-  ?posStmt ps:P39 ?pos .
 
-  # The position must be a French political position (country = France)
-  ?pos wdt:P17 wd:Q142 .
+def _get_entities(batch_size: int, max_batches: int) -> dict:
+    """
+    Return the cached entity dict, or populate it on first call.
 
-  OPTIONAL {{ ?person wdt:P569 ?dateOfBirth . }}
-  OPTIONAL {{ ?person wdt:P570 ?dateOfDeath . }}
-  OPTIONAL {{ ?person wdt:P21 ?gender . }}
-  OPTIONAL {{
-    ?wikipediaFR schema:about ?person ;
-                 schema:inLanguage "fr" ;
-                 schema:isPartOf <https://fr.wikipedia.org/> .
-  }}
-  OPTIONAL {{ ?person wdt:P18 ?image . }}
+    If called multiple times with different parameters (e.g. during testing),
+    the cache from the first call is reused.  The parameters only take effect
+    on the very first invocation.
+    """
+    global _ENTITY_CACHE, _CACHE_BATCH_SIZE, _CACHE_MAX_BATCHES
 
-  SERVICE wikibase:label {{
-    bd:serviceParam wikibase:language "fr,en" .
-  }}
-}}
-ORDER BY ?person
-LIMIT {limit}
-OFFSET {offset}
-"""
+    if _ENTITY_CACHE is not None:
+        return _ENTITY_CACHE
 
+    _CACHE_BATCH_SIZE = batch_size
+    _CACHE_MAX_BATCHES = max_batches
+
+    logger.info("--- Phase 1: Harvesting Q-ids via SPARQL ---")
+    qids = _harvest_qids()
+
+    logger.info("--- Phase 2: Fetching entity data via wbgetentities ---")
+    _ENTITY_CACHE = _fetch_all_entities(qids, batch_size=batch_size, max_batches=max_batches)
+
+    return _ENTITY_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Mapping from Wikidata position Q-ids to canonical French role names.
+# ---------------------------------------------------------------------------
+
+POSITION_ROLE_MAP: dict[str, str] = {
+    "Q3291418": "Député",                    # member of the National Assembly (generic)
+    "Q3044918": "Député",                    # member of the National Assembly (via session query)
+    "Q3918957": "Sénateur",                  # member of the French Senate
+    "Q191954":  "Président de la République",
+    "Q191958":  "Premier ministre",
+    "Q17375":   "Ministre",                  # government minister (generic)
+    "Q382617":  "Maire",                     # mayor
+    "Q483388":  "Président de région",
+    "Q1021645": "Conseiller régional",
+    "Q1307288": "Conseiller départemental",
+    "Q2311456": "Député européen",           # MEP
+    "Q27169":   "Secrétaire d'État",
+    "Q2285706": "Préfet",
+}
+
+# Gender Q-id mapping
+_GENDER_MAP: dict[str, str] = {
+    "Q6581072": "female",
+    "Q6581097": "male",
+}
+
+# ---------------------------------------------------------------------------
+# Parse helpers
+# ---------------------------------------------------------------------------
+
+def _normalise_role_name(position_qid: str, position_label: str) -> str:
+    """
+    Map a Wikidata position Q-id to a canonical role name.
+
+    Falls back to the French label from Wikidata if the Q-id is not in the map.
+    Strips trailing geographic qualifiers like "(Paris)" from labels.
+    """
+    if position_qid in POSITION_ROLE_MAP:
+        return POSITION_ROLE_MAP[position_qid]
+
+    # Clean up the label: remove parenthetical suffixes
+    label = re.sub(r"\s*\([^)]*\)\s*$", "", position_label).strip()
+    return label if label else position_qid
+
+
+def _image_url_from_filename(filename: Optional[str]) -> Optional[str]:
+    """
+    Construct a Wikimedia Commons Special:FilePath URL from an image filename.
+
+    The filename comes from the P18 claim string value, e.g. "Jean Dupont.jpg".
+    We URL-encode spaces and special characters using the same convention as
+    Wikimedia (spaces -> underscores in the canonical form, but Special:FilePath
+    accepts the raw filename too via percent-encoding).
+    """
+    if not filename:
+        return None
+    # Wikimedia normalises spaces to underscores in filenames
+    encoded = urllib.parse.quote(filename.replace(" ", "_"), safe="")
+    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{encoded}"
+
+
+def _wikipedia_fr_url(entity: dict) -> Optional[str]:
+    """
+    Extract the French Wikipedia URL from sitelinks.
+    """
+    try:
+        return entity["sitelinks"]["frwiki"]["url"]
+    except KeyError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Entity-level parsers — one per domain object
+# ---------------------------------------------------------------------------
+
+def _parse_person(qid: str, entity: dict) -> Optional[Person]:
+    """
+    Parse a wbgetentities entity blob into a Person model.
+
+    Returns None if the entity is a redirect or has no usable label.
+    """
+    # Wikidata marks missing or redirected entities
+    if entity.get("missing") == "" or entity.get("redirects"):
+        return None
+
+    name = _entity_label(entity)
+    # If the label is just the Q-id, the entity likely has no useful label
+    if name == qid:
+        logger.debug("Skipping %s — no label found.", qid)
+        return None
+
+    gender_qid = _claim_item_id(entity, "P21")
+    gender = _GENDER_MAP.get(gender_qid) if gender_qid else None
+
+    image_filename = _claim_string(entity, "P18")
+    image_url = _image_url_from_filename(image_filename)
+
+    return Person(
+        wikidata_id=qid,
+        name=name,
+        date_of_birth=_claim_time(entity, "P569"),
+        date_of_death=_claim_time(entity, "P570"),
+        gender=gender,
+        wikipedia_fr_url=_wikipedia_fr_url(entity),
+        image_url=image_url,
+    )
+
+
+def _parse_party_memberships(
+    qid: str,
+    entity: dict,
+    parties_by_id: dict[str, Party],
+) -> list[PartyMembership]:
+    """
+    Parse all P102 (party membership) claims for one entity.
+
+    Populates ``parties_by_id`` in-place as a side effect.
+    Returns a list of PartyMembership objects (may be empty).
+    """
+    memberships: list[PartyMembership] = []
+    p102_claims = entity.get("claims", {}).get("P102", [])
+
+    for stmt in p102_claims:
+        try:
+            mainsnak = stmt.get("mainsnak", {})
+            if mainsnak.get("snaktype") != "value":
+                continue
+
+            party_qid = mainsnak["datavalue"]["value"]["id"]
+
+            # Collect Party node data from the claim — we only have the Q-id
+            # here; the label will be fetched if we encounter the party entity
+            # directly, otherwise we leave a placeholder.
+            if party_qid not in parties_by_id:
+                parties_by_id[party_qid] = Party(
+                    wikidata_id=party_qid,
+                    name=f"Parti {party_qid}",  # placeholder — enriched later
+                )
+
+            start = _qualifier_time(stmt, "P580")
+            end = _qualifier_time(stmt, "P582")
+            is_current = end is None
+
+            memberships.append(
+                PartyMembership(
+                    person_wikidata_id=qid,
+                    party_wikidata_id=party_qid,
+                    from_date=start,
+                    to_date=end,
+                    is_current=is_current,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Skipping malformed P102 claim for %s: %s", qid, exc)
+
+    return memberships
+
+
+def _parse_mandates(qid: str, entity: dict) -> list[Mandate]:
+    """
+    Parse all P39 (position held) claims for one entity.
+
+    Only positions present in POSITION_ROLE_MAP are included.  Positions not
+    in the map are also included but receive a label-derived role name.
+    """
+    mandates: list[Mandate] = []
+    p39_claims = entity.get("claims", {}).get("P39", [])
+
+    for stmt in p39_claims:
+        try:
+            mainsnak = stmt.get("mainsnak", {})
+            if mainsnak.get("snaktype") != "value":
+                continue
+
+            position_qid = mainsnak["datavalue"]["value"]["id"]
+            # Only keep positions that map to a known role
+            if position_qid not in POSITION_ROLE_MAP:
+                continue
+
+            role_name = POSITION_ROLE_MAP[position_qid]
+            start = _qualifier_time(stmt, "P580")
+            end = _qualifier_time(stmt, "P582")
+            is_current = end is None
+
+            # P768 = electoral district / constituency
+            constituency_qid = _qualifier_item_id(stmt, "P768")
+            # We store the Q-id as a string — the loader will use it as-is.
+            # A future enrichment pass can resolve it to a name.
+            constituency: Optional[str] = constituency_qid
+
+            mandates.append(
+                Mandate(
+                    person_wikidata_id=qid,
+                    role_name=role_name,
+                    from_date=start,
+                    to_date=end,
+                    is_current=is_current,
+                    constituency=constituency,
+                    wikidata_position_id=position_qid,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Skipping malformed P39 claim for %s: %s", qid, exc)
+
+    return mandates
+
+
+def _enrich_party_labels(parties_by_id: dict[str, Party], entities: dict) -> None:
+    """
+    Replace placeholder Party names with real labels wherever the party entity
+    appears in the fetched entity set.
+
+    This is a best-effort pass — parties that were not fetched (because they are
+    not politicians themselves) keep their "Parti Q..." placeholder name.
+    """
+    for party_qid, party in parties_by_id.items():
+        if party_qid in entities:
+            entity = entities[party_qid]
+            label = _entity_label(entity)
+            if label and label != party_qid:
+                # Build an enriched Party with any extra fields we can extract
+                parties_by_id[party_qid] = Party(
+                    wikidata_id=party_qid,
+                    name=label,
+                    short_name=party.short_name,
+                    founded_date=_claim_time(entity, "P571"),
+                    dissolved_date=_claim_time(entity, "P576"),
+                )
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
 
 def fetch_politicians(
     page_size: Optional[int] = None,
@@ -261,93 +747,29 @@ def fetch_politicians(
     Parameters
     ----------
     page_size:
-        Results per SPARQL page.  Defaults to settings.etl_page_size.
+        wbgetentities batch size (max 50, default 50).
     max_pages:
-        0 = all pages.  Set to a small number for testing (e.g. 1 = 200 politicians).
+        Maximum number of entity batches to process.  0 = all batches.
+        Set to 1 for a smoke test covering the first 50 entities.
 
     Returns
     -------
-    Deduplicated list of Person instances.
+    Deduplicated list of Person instances, one per unique Q-id.
     """
-    if page_size is None:
-        page_size = settings.etl_page_size
+    batch_size = min(page_size or _MAX_IDS_PER_REQUEST, _MAX_IDS_PER_REQUEST)
+    entities = _get_entities(batch_size=batch_size, max_batches=max_pages)
 
-    rows = _paginate_sparql(_POLITICIANS_QUERY, page_size=page_size, max_pages=max_pages)
-
-    seen: set[str] = set()
     persons: list[Person] = []
-
-    for row in rows:
+    for qid, entity in entities.items():
         try:
-            qid = _extract_qid(row["person"]["value"])
-            if qid in seen:
-                continue
-            seen.add(qid)
-
-            gender_raw = row.get("genderLabel", {}).get("value")
-            gender: Optional[str] = None
-            if gender_raw:
-                g = gender_raw.lower()
-                if "female" in g or "femme" in g or "féminin" in g:
-                    gender = "female"
-                elif "male" in g or "masculin" in g or "homme" in g:
-                    gender = "male"
-                else:
-                    gender = "other"
-
-            persons.append(
-                Person(
-                    wikidata_id=qid,
-                    name=row.get("personLabel", {}).get("value", qid),
-                    date_of_birth=_parse_date(row.get("dateOfBirth", {}).get("value")),
-                    date_of_death=_parse_date(row.get("dateOfDeath", {}).get("value")),
-                    gender=gender,
-                    wikipedia_fr_url=row.get("wikipediaFR", {}).get("value"),
-                    image_url=row.get("image", {}).get("value"),
-                )
-            )
+            person = _parse_person(qid, entity)
+            if person is not None:
+                persons.append(person)
         except Exception as exc:
-            logger.warning("Skipping malformed row: %s — %s", row, exc)
+            logger.warning("Skipping entity %s during person parse: %s", qid, exc)
 
-    logger.info("fetch_politicians(): %d unique persons fetched.", len(persons))
+    logger.info("fetch_politicians(): %d unique persons parsed.", len(persons))
     return persons
-
-
-# ---------------------------------------------------------------------------
-# Query 2: Party memberships
-# ---------------------------------------------------------------------------
-
-_MEMBERSHIPS_QUERY = """
-SELECT DISTINCT
-  ?person
-  ?party
-  ?partyLabel
-  ?partyShortName
-  ?startDate
-  ?endDate
-WHERE {{
-  # Person must hold a French political position (same filter as politicians query)
-  ?person wdt:P31 wd:Q5 .
-  ?person p:P39 ?posStmt .
-  ?posStmt ps:P39 ?pos .
-  ?pos wdt:P17 wd:Q142 .
-
-  # Party membership statement
-  ?person p:P102 ?memberStmt .
-  ?memberStmt ps:P102 ?party .
-
-  OPTIONAL {{ ?memberStmt pq:P580 ?startDate . }}
-  OPTIONAL {{ ?memberStmt pq:P582 ?endDate . }}
-  OPTIONAL {{ ?party wdt:P1813 ?partyShortName . }}
-
-  SERVICE wikibase:label {{
-    bd:serviceParam wikibase:language "fr,en" .
-  }}
-}}
-ORDER BY ?person ?party
-LIMIT {limit}
-OFFSET {offset}
-"""
 
 
 def fetch_party_memberships(
@@ -357,134 +779,42 @@ def fetch_party_memberships(
     """
     Fetch party membership records and derive Party nodes.
 
-    Returns a tuple of (memberships, parties) so the caller can upsert both.
-
     Parameters
     ----------
     page_size:
-        Results per page.
+        wbgetentities batch size (max 50, default 50).
     max_pages:
-        0 = all pages.
-    """
-    if page_size is None:
-        page_size = settings.etl_page_size
+        Maximum number of entity batches to process.  0 = all batches.
 
-    rows = _paginate_sparql(_MEMBERSHIPS_QUERY, page_size=page_size, max_pages=max_pages)
+    Returns
+    -------
+    Tuple of (memberships, parties) for the caller to upsert both.
+    """
+    batch_size = min(page_size or _MAX_IDS_PER_REQUEST, _MAX_IDS_PER_REQUEST)
+    entities = _get_entities(batch_size=batch_size, max_batches=max_pages)
 
     memberships: list[PartyMembership] = []
     parties_by_id: dict[str, Party] = {}
 
-    for row in rows:
+    for qid, entity in entities.items():
+        if entity.get("missing") == "" or entity.get("redirects"):
+            continue
         try:
-            person_qid = _extract_qid(row["person"]["value"])
-            party_qid = _extract_qid(row["party"]["value"])
-
-            # Collect Party data opportunistically
-            if party_qid not in parties_by_id:
-                party_name = row.get("partyLabel", {}).get("value", party_qid)
-                # Skip parties whose label is just the Q-id (unresolved)
-                if party_name == party_qid:
-                    party_name = f"Parti {party_qid}"
-                parties_by_id[party_qid] = Party(
-                    wikidata_id=party_qid,
-                    name=party_name,
-                    short_name=row.get("partyShortName", {}).get("value"),
-                )
-
-            start = _parse_date(row.get("startDate", {}).get("value"))
-            end = _parse_date(row.get("endDate", {}).get("value"))
-
-            # A membership is "current" if there is no end date recorded
-            is_current = end is None
-
-            memberships.append(
-                PartyMembership(
-                    person_wikidata_id=person_qid,
-                    party_wikidata_id=party_qid,
-                    from_date=start,
-                    to_date=end,
-                    is_current=is_current,
-                )
-            )
+            ms = _parse_party_memberships(qid, entity, parties_by_id)
+            memberships.extend(ms)
         except Exception as exc:
-            logger.warning("Skipping malformed membership row: %s — %s", row, exc)
+            logger.warning("Skipping entity %s during membership parse: %s", qid, exc)
+
+    # Best-effort label enrichment for parties that appear in the entity set
+    _enrich_party_labels(parties_by_id, entities)
 
     parties = list(parties_by_id.values())
     logger.info(
-        "fetch_party_memberships(): %d memberships, %d unique parties.",
+        "fetch_party_memberships(): %d memberships, %d unique parties parsed.",
         len(memberships),
         len(parties),
     )
     return memberships, parties
-
-
-# ---------------------------------------------------------------------------
-# Query 3: Mandates / political roles
-# ---------------------------------------------------------------------------
-
-# Mapping from Wikidata position Q-ids to canonical French role names.
-# We use this to normalise the many specific Wikidata positions into a
-# smaller set of Role nodes in our graph.
-POSITION_ROLE_MAP: dict[str, str] = {
-    "Q3291418": "Député",                    # member of the National Assembly
-    "Q3918957": "Sénateur",                  # member of the French Senate
-    "Q191954":  "Président de la République",
-    "Q191958":  "Premier ministre",
-    "Q17375": "Ministre",                    # government minister (generic)
-    "Q382617":  "Maire",                     # mayor
-    "Q483388":  "Président de région",
-    "Q1021645": "Conseiller régional",
-    "Q1307288": "Conseiller départemental",
-    "Q2311456": "Député européen",           # MEP
-    "Q27169":   "Secrétaire d'État",
-    "Q2285706": "Préfet",
-}
-
-_MANDATES_QUERY = """
-SELECT DISTINCT
-  ?person
-  ?position
-  ?positionLabel
-  ?startDate
-  ?endDate
-  ?constituency
-  ?constituencyLabel
-WHERE {{
-  # Person must be a French politician
-  ?person wdt:P31 wd:Q5 .
-  ?person p:P39 ?posStmt .
-  ?posStmt ps:P39 ?position .
-
-  # Position must be tied to France
-  ?position wdt:P17 wd:Q142 .
-
-  OPTIONAL {{ ?posStmt pq:P580 ?startDate . }}
-  OPTIONAL {{ ?posStmt pq:P582 ?endDate . }}
-  OPTIONAL {{ ?posStmt pq:P768 ?constituency . }}
-
-  SERVICE wikibase:label {{
-    bd:serviceParam wikibase:language "fr,en" .
-  }}
-}}
-ORDER BY ?person ?position
-LIMIT {limit}
-OFFSET {offset}
-"""
-
-
-def _normalise_role_name(position_qid: str, position_label: str) -> str:
-    """
-    Map a Wikidata position Q-id to a canonical role name.
-
-    Falls back to the French label from Wikidata if the Q-id is not in our map.
-    Strips trailing geographic qualifiers like "(Paris)" from labels.
-    """
-    if position_qid in POSITION_ROLE_MAP:
-        return POSITION_ROLE_MAP[position_qid]
-
-    # Clean up the label: remove parenthetical suffixes
-    label = re.sub(r"\s*\([^)]*\)\s*$", "", position_label).strip()
-    return label if label else position_qid
 
 
 def fetch_mandates(
@@ -497,48 +827,27 @@ def fetch_mandates(
     Parameters
     ----------
     page_size:
-        Results per page.
+        wbgetentities batch size (max 50, default 50).
     max_pages:
-        0 = all pages.
+        Maximum number of entity batches to process.  0 = all batches.
 
     Returns
     -------
     List of Mandate instances.
     """
-    if page_size is None:
-        page_size = settings.etl_page_size
-
-    rows = _paginate_sparql(_MANDATES_QUERY, page_size=page_size, max_pages=max_pages)
+    batch_size = min(page_size or _MAX_IDS_PER_REQUEST, _MAX_IDS_PER_REQUEST)
+    entities = _get_entities(batch_size=batch_size, max_batches=max_pages)
 
     mandates: list[Mandate] = []
 
-    for row in rows:
+    for qid, entity in entities.items():
+        if entity.get("missing") == "" or entity.get("redirects"):
+            continue
         try:
-            person_qid = _extract_qid(row["person"]["value"])
-            position_qid = _extract_qid(row["position"]["value"])
-            position_label = row.get("positionLabel", {}).get("value", position_qid)
-
-            role_name = _normalise_role_name(position_qid, position_label)
-
-            start = _parse_date(row.get("startDate", {}).get("value"))
-            end = _parse_date(row.get("endDate", {}).get("value"))
-            is_current = end is None
-
-            constituency = row.get("constituencyLabel", {}).get("value")
-
-            mandates.append(
-                Mandate(
-                    person_wikidata_id=person_qid,
-                    role_name=role_name,
-                    from_date=start,
-                    to_date=end,
-                    is_current=is_current,
-                    constituency=constituency,
-                    wikidata_position_id=position_qid,
-                )
-            )
+            ms = _parse_mandates(qid, entity)
+            mandates.extend(ms)
         except Exception as exc:
-            logger.warning("Skipping malformed mandate row: %s — %s", row, exc)
+            logger.warning("Skipping entity %s during mandate parse: %s", qid, exc)
 
-    logger.info("fetch_mandates(): %d mandates fetched.", len(mandates))
+    logger.info("fetch_mandates(): %d mandates parsed.", len(mandates))
     return mandates

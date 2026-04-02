@@ -23,6 +23,7 @@ class Person(BaseModel):
 
     wikidata_id: str = Field(..., description="Wikidata Q-identifier, e.g. Q1234")
     name: str = Field(..., description="Full name in French (fr label)")
+    description: Optional[str] = Field(None, description="Short bio, e.g. 'French politician'")
     date_of_birth: Optional[str] = Field(None, description="ISO date YYYY-MM-DD")
     date_of_death: Optional[str] = Field(None, description="ISO date YYYY-MM-DD, null if alive")
     gender: Optional[str] = Field(None, description="male | female | other")
