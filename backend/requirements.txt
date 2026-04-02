@@ -1,0 +1,21 @@
+# Runtime dependencies for the French Politics Knowledge Graph backend
+# Install with: pip install -r backend/requirements.txt
+
+# Neo4j Python driver (official)
+neo4j>=5.14.0,<6.0
+
+# HTTP client for Wikidata SPARQL requests
+requests>=2.31.0,<3.0
+
+# Data validation and serialisation
+pydantic>=2.5.0,<3.0
+
+# Settings management with .env file support
+pydantic-settings>=2.1.0,<3.0
+
+# .env file loading (pulled in by pydantic-settings but listed explicitly)
+python-dotenv>=1.0.0,<2.0
+
+# API layer — Phase 1 scaffold (routes added in Phase 2)
+fastapi>=0.109.0,<1.0
+uvicorn[standard]>=0.27.0,<1.0
